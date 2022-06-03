@@ -23,6 +23,7 @@ from laplace import Laplace
 from laplace.curvature import AsdlEF
 import sys
 import tqdm
+import scipy.special
 
 import new_models
 from utils import *
@@ -39,18 +40,18 @@ import math
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR100 Training')
 parser.add_argument('--batch_size', default=32, type=int, help='batch size')
-parser.add_argument('--sample_batch_size', default=16, type=int, help='batch size used when computing the bma accuracy')
+parser.add_argument('--sample_batch_size', default=16, type=int, help='batch size')
 parser.add_argument('--seed', default=10, type=int, help='seed')
 parser.add_argument('--decay', type=float, help='weight decay')
 parser.add_argument('--base_lr', default=0.01, type=float, help='base learning rate')
 parser.add_argument('--data_ratio', default=0.8, type=float, help='ratio of the data to use for CMLL')
 parser.add_argument('--bma_nsamples', default=20, type=int, help='whether or not to use bma to get CMLL')
-parser.add_argument('--max_iters', default=50, type=int, help='max epochs for tuning the temperature')
+parser.add_argument('--max_epochs', default=50, type=int, help='max epochs for tuning the temperature')
 parser.add_argument('--hessian_structure', default='kron', type=str, help='structure of the hessian')
 parser.add_argument('--prior_structure', default='scalar', type=str, help='structure of the prior: scalar or layerwise')
-parser.add_argument('--partialtrain_chk_path', default="checkpoint/cifar100/subset/resnets" , type=str, help='path for the checkpoint for the model trained on a fraction of the data')
-parser.add_argument('--fulltrain_chk_path', default="checkpoint/cifar100/optimized_la" , type=str, help='path for the checkpoint for the model trained on the full data')
-parser.add_argument('--result_folder', default='./results/cifar100/subset/resnets/cmll/', type=str, help='path of the results')
+parser.add_argument('--partialtrain_chk_path', default="checkpoint/cifar100/subset/resnets" , type=str, help='path for the checkpoint for this model')
+parser.add_argument('--fulltrain_chk_path', default="checkpoint/cifar100/optimized_la" , type=str, help='path for the checkpoint for this model')
+parser.add_argument('--result_folder', default='./results/cifar100/subset/resnets/cmll/rebuttal/', type=str, help='path of the results')
 
 args = parser.parse_args()
 
@@ -169,20 +170,19 @@ def get_bma_acc(net, la, loader, n_samples, hessian_structure, temp=1.0):
 
     return bma_accuracy, bma_probs, all_ys
 
-def get_ll(bma_probs, all_ys, eps=1e-4):
+def get_cmll(bma_probs, all_ys, eps=1e-4):
     log_lik = 0      
-    eps = 1e-4
     for i, label in enumerate(all_ys):
         probs_i = bma_probs[i]
         probs_i += eps
         probs_i[np.argmax(probs_i)] -= eps * len(probs_i)
         log_lik += np.log(probs_i[label]).item()
-    ll = log_lik/len(all_ys)
+    cmll = log_lik/len(all_ys)
     
-    return ll
+    return cmll
 
-def get_clml(net, la, loader, n_samples,
-    hessian_structure, temp=1.0):
+def get_cmll_new(net, la, loader, n_samples,
+    hessian_structure, temp=1.0, eps=1e-4):
     device = parameters_to_vector(net.parameters()).device
     samples = torch.randn(n_samples, la.n_params, device=device)
     if hessian_structure == "kron":
@@ -233,9 +233,12 @@ def get_mll_acc(arch,
                 prior_structure,
                 base_lr,
                 bma_nsamples,
-                max_iters,
-                result_folder):
-            
+                max_epochs,
+                result_folder,
+                get_val_only=False):
+    
+    start = time.time()
+        
     path = "cifar100_" + str(prior_prec_init) + '_' + arch + '_' + str(width) + '_' + prior_structure + '_baselr_' + str(base_lr)
         
     print("this is the current path ... ", path)
@@ -249,7 +252,7 @@ def get_mll_acc(arch,
     
     if not os.path.exists(cknew_path1) and not os.path.exists(cknew_path2):
         print("the corresponding fully trained model does not exist ... ") 
-        return
+        return 
     
     # log for keeping accuracy 
     logname = result_folder + path + '_cmllbma.csv'
@@ -268,6 +271,7 @@ def get_mll_acc(arch,
     net = new_models.__dict__[arch](width)
     num_params = sum(p.numel() for p in net.parameters())
     print("num of params: ", num_params)
+    
     
     cknew_path = path + '_final'
     cknew_path = './' + partialtrain_chk_path + '/' + cknew_path + '.ckpt'
@@ -295,13 +299,25 @@ def get_mll_acc(arch,
     # making results directory
     if not os.path.exists(result_folder):
         os.makedirs(result_folder)
+
+    if get_val_only:
+        if not os.path.exists(logname):
+            with open(logname, 'w') as logfile:
+                logwriter = csv.writer(logfile, delimiter=',')
+                logwriter.writerow(['valid_loss', 'valid_acc'])
+        valid_loss, valid_acc, best_acc = test(0, net, trainloader_test, 0.0, None, None, debug=True)
+        print("valid_loss: {}, valid_acc: {}".format(valid_loss, valid_acc))
+        with open(logname, 'a') as logfile:
+            logwriter = csv.writer(logfile, delimiter=',')
+            logwriter.writerow([valid_loss, valid_acc])
+
+        return None
+
     
     if not os.path.exists(logname):
         with open(logname, 'w') as logfile:
             logwriter = csv.writer(logfile, delimiter=',')
-            logwriter.writerow(['num_params', 'decay', 'best temperature',
-                                'test acc', 'bma test acc', 'bma s3 acc',
-                                'test LL', 'bma test LL', 'cmll'])
+            logwriter.writerow(['num_params', 'decay', 'best temperature', 'test acc', 'bma test acc', 'bma s3 acc', 'test LL', 'bma test LL', 'cmll'])
     
      
     print("fitting LA for the trainset 1")
@@ -318,10 +334,12 @@ def get_mll_acc(arch,
     best_temp = temp
     buffer = 0
     max_buffer = 2
-    while epoch < max_iters: 
-        cmll, bma_accuracy = get_clml(net, la, trainloader_valid,
-            bma_nsamples, hessian_structure, temp=temp)
+    while epoch < max_epochs: 
+        # bma_accuracy, bma_probs, all_ys = get_bma_acc(net, la, trainloader_valid, bma_nsamples, hessian_structure, temp=temp)
+        # cmll = get_cmll(bma_probs, all_ys, eps=1e-4)
+        cmll, bma_accuracy = get_cmll_new(net, la, trainloader_valid, bma_nsamples, hessian_structure, temp=temp)
         print("current temperate: {}, bma accuracy: {}, cmll: {}".format(temp, bma_accuracy, cmll))
+        # raise
         if bma_accuracy > best_accuracy:
             best_accuracy = bma_accuracy
             best_temp = temp
@@ -333,13 +351,13 @@ def get_mll_acc(arch,
         else:
             break
         epoch += 1
+
         
     print("best temperate: {}, bma accuracy: {}".format(best_temp, best_accuracy))
     
-    cmll, bma_accuracy = get_clml(net, la, trainloader_test,
-        bma_nsamples, hessian_structure, temp=best_temp)
+    cmll, bma_accuracy = get_cmll_new(net, la, trainloader_test, bma_nsamples, hessian_structure, temp=best_temp)
+
     
-    # define the original net 
     print("=> creating model 'fixup_cnn{}_{}'".format(arch, width))
     net = net = new_models.__dict__[arch](width)
     num_params = sum(p.numel() for p in net.parameters())
@@ -365,22 +383,26 @@ def get_mll_acc(arch,
     print("done fitting LA for the full data")
         
         
-    bma_test_accuracy, bma_test_probs, all_test_ys = get_bma_acc(net, la, testloader,
-                                                                 bma_nsamples, hessian_structure, temp=best_temp)
-    bma_test_ll = get_ll(bma_test_probs, all_test_ys, eps=1e-4)
+    bma_test_accuracy, bma_test_probs, all_test_ys = get_bma_acc(net, la, testloader, bma_nsamples, hessian_structure, temp=best_temp)
+    bma_test_ll = get_cmll(bma_test_probs, all_test_ys, eps=1e-4)
     
     test_acc, all_probs, all_ys = get_acc(net, testloader)
-    test_nll = get_ll(all_probs, all_ys, eps=1e-4)
+    test_nll = get_cmll(all_probs, all_ys, eps=1e-4)
     
     with open(logname, 'a') as logfile:
         logwriter = csv.writer(logfile, delimiter=',')
         logwriter.writerow([num_params, prior_prec_init, best_temp,
                             test_acc, bma_test_accuracy, bma_accuracy,
                             test_nll, bma_test_ll, cmll])
+        
+    end = time.time()
+    
+    print("+++++++++++++++++++++++++++++++++++++++++++ time taken for this ... ++++++++++++++++++++++++++++ ", end-start)
               
               
 
-wds = [100.0, 0.000001, 0.01, 0.0001, 0.1, 0.001]
+wds = [0.000001, 0.0001, 0.001]
+
 widths_cifar100 = [32, 40, 48, 56, 64]
 arch_names = ["fixup_resnet20", "fixup_resnet32", "fixup_resnet44", "fixup_resnet56", "fixup_resnet110"] 
 
@@ -398,6 +420,6 @@ for decay in wds:
                         prior_structure = args.prior_structure,
                         base_lr = args.base_lr,
                         bma_nsamples=args.bma_nsamples,
-                        max_iters = args.max_iters, 
+                        max_epochs = args.max_epochs, 
                         result_folder=args.result_folder)
     
