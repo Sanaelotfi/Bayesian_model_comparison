@@ -17,13 +17,13 @@ from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 import torchvision
 import torchvision.transforms as transforms
+import scipy.special
+
 
 import argparse
 import csv
 from laplace import Laplace
 from laplace.curvature import AsdlEF, BackPackGGN, AsdlGGN
-# AsdlHessian, AsdlGGN, AsdlEF, AsdlInterface
-# , AsdlHessian
 import sys
 import tqdm
 
@@ -170,18 +170,47 @@ def get_bma_acc(net, la, loader, n_samples, hessian_structure, temp=1.0):
 
     return bma_accuracy, bma_probs, all_ys
 
-def get_cmll(bma_probs, all_ys, eps=1e-4):
-    log_lik = 0      
-    eps = 1e-4
+
+def get_cmll_new(net, la, loader, n_samples,
+    hessian_structure, temp=1.0, eps=1e-4):
+    device = parameters_to_vector(net.parameters()).device
+    samples = torch.randn(n_samples, la.n_params, device=device)
+    if hessian_structure == "kron":
+        samples = la.posterior_precision.bmm(samples, exponent=-0.5)
+        params = la.mean.reshape(1, la.n_params) + samples.reshape(n_samples, la.n_params) * temp
+    elif hessian_structure == "diag":
+        samples = samples * la.posterior_scale.reshape(1, la.n_params) * temp
+        params = la.mean.reshape(1, la.n_params) + samples
+    else:
+        raise
+    all_probs = []
+    for sample_params in params:
+        sample_probs = []
+        all_ys = []
+        with torch.no_grad():
+            vector_to_parameters(sample_params, net.parameters())
+            net.eval()
+            for x, y in loader:
+                logits = net(x.cuda()).detach().cpu()
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                sample_probs.append(probs.detach().cpu().numpy())
+                all_ys.append(y.detach().cpu().numpy())
+            sample_probs = np.concatenate(sample_probs, axis=0)
+            all_ys = np.concatenate(all_ys, axis=0)
+            all_probs.append(sample_probs)
+    all_probs = np.stack(all_probs)
+    bma_probs = np.mean(all_probs, 0)
+    bma_accuracy = (np.argmax(bma_probs, axis=-1) == all_ys).mean() * 100
+    probs_arrays = []  
     for i, label in enumerate(all_ys):
-        probs_i = bma_probs[i]
-        probs_i += eps
-        probs_i[np.argmax(probs_i)] -= eps * len(probs_i)
-        log_lik += np.log(probs_i[label]).item()
-        print(probs_i[label], log_lik)
-    cmll = log_lik/len(all_ys)
+        probs_i = all_probs[:,i,:]
+        lik_array = probs_i[:,label]
+        probs_arrays.append(lik_array)
+    probs_arrays = np.stack(probs_arrays)
+    log_probs_arrays = np.sum(np.log(probs_arrays), axis=0)
+    cmll = scipy.special.logsumexp(log_probs_arrays) - np.log(len(log_probs_arrays))
     
-    return cmll
+    return cmll, bma_accuracy
 
 
 
@@ -257,8 +286,7 @@ def get_mll_acc(model,
     max_buffer = 3
     max_epochs = 50
     while epoch < max_epochs: 
-        bma_accuracy, bma_probs, all_ys = get_bma_acc(net, la, trainloader_valid, bma_nsamples, hessian_structure, temp=temp)
-        cmll = get_cmll(bma_probs, all_ys, eps=1e-4)
+        cmll, bma_accuracy = get_cmll_new(net, la, trainloader_valid, bma_nsamples, hessian_structure, temp=temp)
         print("current temperate: {}, bma accuracy: {}, cmll: {}".format(temp, bma_accuracy, cmll))
         if bma_accuracy > best_accuracy:
             best_accuracy = bma_accuracy
@@ -274,8 +302,7 @@ def get_mll_acc(model,
 
     print("best temperate: {}, bma accuracy: {}".format(best_temp, best_accuracy))
 
-    bma_accuracy, bma_probs, all_ys = get_bma_acc(net, la, trainloader_test, bma_nsamples, hessian_structure, temp=best_temp)
-    cmll = get_cmll(bma_probs, all_ys, eps=1e-4)
+    cmll, bma_accuracy = get_cmll_new(net, la, trainloader_test, bma_nsamples, hessian_structure, temp=best_temp)
 
     with open(logname, 'a') as logfile:
         logwriter = csv.writer(logfile, delimiter=',')
